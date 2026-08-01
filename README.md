@@ -84,7 +84,3 @@ make.bat release x64 2022b builddir <build-directory>
 - HASHED surface and shadow output is stochastic and may differ slightly across hardware, drivers, and sample counts.
 - All frozen GPU backend files are included, but every CUDA/OptiX/HIP/HIPRT/oneAPI combination was not executed on representative hardware.
 - Use the included corrected validation suite. The original test runner had Windows argument handling and assertion defects; these test-only fixes do not alter product behavior.
-
-## GitHub upload note
-
-The portable ZIP is approximately 403 MB and exceeds GitHub's normal 100 MB repository object limit. Upload this pack or the portable ZIP as a **GitHub Release asset**, or track it with Git LFS. Do not commit it as an ordinary Git blob.
