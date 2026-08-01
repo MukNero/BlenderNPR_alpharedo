@@ -1,0 +1,564 @@
+diff --git a/scripts/startup/bl_ui/properties_material.py b/scripts/startup/bl_ui/properties_material.py
+index 45e2aadb..95fbb446 100644
+--- a/scripts/startup/bl_ui/properties_material.py
++++ b/scripts/startup/bl_ui/properties_material.py
+@@ -297,18 +297,23 @@ def draw_material_surface_settings(layout, mat, is_eevee=True):
+         layout.label(text="Unsupported displacement method", icon='ERROR')
+ 
+     if is_eevee:
+-        layout.prop(mat, "use_transparent_shadow")
++        col = layout.column(align=True)
++        col.prop(mat, "blend_method", text="Alpha Mode")
++        if mat.blend_method == 'CLIP':
++            col.prop(mat, "alpha_threshold", text="Clip Threshold")
++        if mat.blend_method == 'BLEND':
++            col.prop(mat, "use_transparency_overlap", text="Transparency Overlap")
++        else:
++            col.prop(mat, "use_raytrace_refraction", text="Raytraced Transmission")
+ 
+-    col = layout.column()
+-    col.prop(mat, "surface_render_method", text="Render Method")
+-    if mat.surface_render_method == 'BLENDED':
+-        col.prop(mat, "use_transparency_overlap", text="Transparency Overlap")
+-    elif mat.surface_render_method == 'DITHERED':
+-        col.prop(mat, "use_raytrace_refraction", text="Raytraced Transmission")
++        col = layout.column(align=True)
++        col.prop(mat, "shadow_method", text="Shadow Alpha Mode")
++        if mat.shadow_method == 'CLIP' and mat.blend_method != 'CLIP':
++            col.prop(mat, "alpha_threshold", text="Shadow Clip Threshold")
+ 
+     col = layout.column()
+     col.prop(mat, "thickness_mode", text="Thickness")
+-    if mat.surface_render_method == 'DITHERED':
++    if mat.blend_method != 'BLEND':
+         col.prop(mat, "use_thickness_from_shadow", text="From Shadow")
+ 
+ 
+diff --git a/source/blender/blenloader/intern/versioning_420.cc b/source/blender/blenloader/intern/versioning_420.cc
+index fd6ad965..de7ecc58 100644
+--- a/source/blender/blenloader/intern/versioning_420.cc
++++ b/source/blender/blenloader/intern/versioning_420.cc
+@@ -307,7 +307,7 @@ static AlphaSource versioning_eevee_alpha_source_get(bNodeSocket *socket, int de
+  *
+  * Only handles the closure tree from the output node.
+  */
+-static bool versioning_eevee_material_blend_mode_settings(bNodeTree *ntree, float threshold)
++[[maybe_unused]] static bool versioning_eevee_material_blend_mode_settings(bNodeTree *ntree, float threshold)
+ {
+   bNode *output_node = version_eevee_output_node_get(ntree, SH_NODE_OUTPUT_MATERIAL);
+   if (output_node == nullptr) {
+@@ -392,7 +392,7 @@ static bool versioning_eevee_material_blend_mode_settings(bNodeTree *ntree, floa
+   return true;
+ }
+ 
+-static void versioning_eevee_material_shadow_none(Material *material)
++[[maybe_unused]] static void versioning_eevee_material_shadow_none(Material *material)
+ {
+   if (!material->use_nodes || material->nodetree == nullptr) {
+     return;
+@@ -491,7 +491,7 @@ static void versioning_eevee_material_shadow_none(Material *material)
+   bke::node_add_link(*ntree, *bsdf_node, *bsdf_out, *mix_node, *mix_in_2);
+ }
+ 
+-void do_versions_after_linking_420(FileData *fd, Main *bmain)
++void do_versions_after_linking_420(FileData * /*fd*/, Main *bmain)
+ {
+   if (!MAIN_VERSION_FILE_ATLEAST(bmain, 402, 15)) {
+     /* Change drivers and animation on "armature.collections" to
+@@ -529,57 +529,24 @@ void do_versions_after_linking_420(FileData *fd, Main *bmain)
+   }
+ 
+   if (!MAIN_VERSION_FILE_ATLEAST(bmain, 402, 51)) {
+-    /* Convert blend method to math nodes. */
++    /* NPR/Goo compatibility: keep the legacy alpha modes as material state.
++     *
++     * Upstream 4.2 converted Opaque and Alpha Clip into extra math/transparent nodes and then
++     * collapsed Opaque, Clip and Hashed into MA_BM_HASHED. That conversion is irreversible for
++     * Goo files and changes hand-authored node trees. This port implements the legacy modes in
++     * Eevee directly, so only synchronize the coarse 5.2 render method and compatibility flag. */
+     if (all_scenes_use(bmain, {RE_engine_id_BLENDER_EEVEE})) {
+       for (Material &material : bmain->materials) {
+-        if (!material.use_nodes || material.nodetree == nullptr) {
+-          /* Nothing to version. */
+-        }
+-        else if (ELEM(material.blend_method, MA_BM_HASHED, MA_BM_BLEND)) {
+-          /* Compatible modes. Nothing to change. */
+-        }
+-        else if (material.blend_shadow == MA_BS_NONE) {
+-          /* No need to match the surface since shadows are disabled. */
+-        }
+-        else if (material.blend_shadow == MA_BS_SOLID) {
+-          /* This is already versioned an transferred to `transparent_shadows`. */
+-        }
+-        else if ((material.blend_shadow == MA_BS_CLIP && material.blend_method != MA_BM_CLIP) ||
+-                 (material.blend_shadow == MA_BS_HASHED))
+-        {
+-          BLO_reportf_wrap(
+-              fd->reports,
+-              RPT_WARNING,
+-              RPT_("Material %s could not be converted because of different Blend Mode "
+-                   "and Shadow Mode (need manual adjustment)\n"),
+-              material.id.name + 2);
+-        }
+-        else {
+-          /* TODO(fclem): Check if threshold is driven or has animation. Bail out if needed? */
+-
+-          float threshold = (material.blend_method == MA_BM_CLIP) ? material.alpha_threshold :
+-                                                                    2.0f;
+-
+-          if (!versioning_eevee_material_blend_mode_settings(material.nodetree, threshold)) {
+-            BLO_reportf_wrap(fd->reports,
+-                             RPT_WARNING,
+-                             RPT_("Material %s could not be converted because of non-trivial "
+-                                  "alpha blending (need manual adjustment)\n"),
+-                             material.id.name + 2);
+-          }
+-        }
+-
+-        if (material.blend_shadow == MA_BS_NONE) {
+-          versioning_eevee_material_shadow_none(&material);
+-        }
+-        /* Set blend_mode & blend_shadow for forward compatibility. */
+-        material.blend_method = (material.blend_method != MA_BM_BLEND) ? MA_BM_HASHED :
+-                                                                         MA_BM_BLEND;
+-        material.blend_shadow = (material.blend_shadow == MA_BS_SOLID) ? MA_BS_SOLID :
+-                                                                         MA_BS_HASHED;
++        material.surface_render_method = (material.blend_method == MA_BM_BLEND) ?
++                                             MA_SURFACE_METHOD_FORWARD :
++                                             MA_SURFACE_METHOD_DEFERRED;
++        SET_FLAG_FROM_TEST(material.blend_flag,
++                           ELEM(material.blend_shadow, MA_BS_CLIP, MA_BS_HASHED),
++                           MA_BL_TRANSPARENT_SHADOW);
+       }
+     }
+   }
++
+ }
+ 
+ static void image_settings_avi_to_ffmpeg(Scene *scene)
+@@ -1348,7 +1315,7 @@ void blo_do_versions_420(FileData *fd, Library * /*lib*/, Main *bmain)
+     if (all_scenes_use(bmain, {RE_engine_id_BLENDER_EEVEE})) {
+       /* Re-apply versioning made for EEVEE-Next in 4.1 before it got delayed. */
+       for (Material &material : bmain->materials) {
+-        bool transparent_shadows = material.blend_shadow != MA_BS_SOLID;
++        bool transparent_shadows = ELEM(material.blend_shadow, MA_BS_CLIP, MA_BS_HASHED);
+         SET_FLAG_FROM_TEST(material.blend_flag, transparent_shadows, MA_BL_TRANSPARENT_SHADOW);
+       }
+       for (Material &mat : bmain->materials) {
+diff --git a/source/blender/draw/engines/eevee/eevee_material.cc b/source/blender/draw/engines/eevee/eevee_material.cc
+index 08ddafe3..0fc5cb5a 100644
+--- a/source/blender/draw/engines/eevee/eevee_material.cc
++++ b/source/blender/draw/engines/eevee/eevee_material.cc
+@@ -843,15 +843,18 @@ Material &MaterialModule::material_sync(const ObjectHandle &ob_handle,
+         inst_.shadows.reset();
+       }
+     }
+-    if (is_shadow_caster && !disable_depth_offset_shadow) {
++    if (is_shadow_caster && !disable_depth_offset_shadow &&
++        blender_mat->blend_shadow != MA_BS_NONE)
++    {
+       mat.shadow = material_pass_get(ob, blender_mat, MAT_PIPE_SHADOW, geometry_type);
+     }
+ 
+     mat.is_alpha_blend_transparent = color_write && use_forward_pipeline &&
+                                      material_has_flag(mat.shading, GPU_MATFLAG_TRANSPARENT);
+-    mat.has_transparent_shadows = !disable_depth_offset_shadow &&
+-                                  ((blender_mat->blend_flag & MA_BL_TRANSPARENT_SHADOW) != 0) &&
+-                                  material_has_flag(mat.shading, GPU_MATFLAG_TRANSPARENT);
++    mat.has_transparent_shadows =
++        !disable_depth_offset_shadow &&
++        ELEM(blender_mat->blend_shadow, MA_BS_CLIP, MA_BS_HASHED) &&
++        material_has_flag(mat.shading, GPU_MATFLAG_TRANSPARENT);
+ 
+     MaterialStencilState stencil = material_stencil_state_get(blender_mat);
+     if (!hide_on_camera && mat.has_surface && stencil.enabled && !mat.is_alpha_blend_transparent &&
+diff --git a/source/blender/draw/engines/eevee/eevee_shader.cc b/source/blender/draw/engines/eevee/eevee_shader.cc
+index aa008030..5dd9416a 100644
+--- a/source/blender/draw/engines/eevee/eevee_shader.cc
++++ b/source/blender/draw/engines/eevee/eevee_shader.cc
+@@ -28,6 +28,8 @@
+ #include "BLI_assert.h"
+ #include "BLI_math_bits.h"
+ #include "BLI_set.hh"
++
++#include <algorithm>
+ #include <fmt/format.h>
+ 
+ namespace blender::eevee {
+@@ -1518,7 +1520,7 @@ void ShaderModule::material_create_info_amend(GPUMaterial *gpumat, GPUCodegenOut
+                                  transparent_shadows,
+                                  use_outline,
+                                  uuid_depth_offset_affect_lighting);
+-  UNUSED_VARS(uuid_depth_offset_affect_lighting);
++  UNUSED_VARS(transparent_shadows, uuid_depth_offset_affect_lighting);
+ 
+   GPUCodegenOutput &codegen = *codegen_;
+   ShaderCreateInfo &info = *reinterpret_cast<ShaderCreateInfo *>(codegen.create_info);
+@@ -1582,18 +1584,52 @@ void ShaderModule::material_create_info_amend(GPUMaterial *gpumat, GPUCodegenOut
+     use_ao_node = true;
+   }
+ 
+-  bool use_transparency = false;
+-  if (GPU_material_flag_get(gpumat, GPU_MATFLAG_TRANSPARENT)) {
+-    if (pipeline_type != MAT_PIPE_SHADOW || transparent_shadows) {
+-      info.define("MAT_TRANSPARENT");
+-      use_transparency = true;
+-    }
+-    /* Transparent material do not have any velocity specific pipeline. */
+-    if (pipeline_type == MAT_PIPE_PREPASS_FORWARD_VELOCITY) {
++  const blender::Material *blender_mat = GPU_material_get_material(gpumat);
++  const int material_alpha_mode = blender_mat ? blender_mat->blend_method : MA_BM_HASHED;
++  const int material_shadow_alpha_mode = blender_mat ? blender_mat->blend_shadow : MA_BS_HASHED;
++  const float alpha_threshold = std::clamp(blender_mat ? blender_mat->alpha_threshold : 0.5f,
++                                           0.0f,
++                                           1.0f);
++  const int material_alpha_threshold_u16 = int(alpha_threshold * 65535.0f + 0.5f);
++
++  const bool is_prepass = ELEM(pipeline_type,
++                               MAT_PIPE_PREPASS_FORWARD_VELOCITY,
++                               MAT_PIPE_PREPASS_DEFERRED_VELOCITY,
++                               MAT_PIPE_PREPASS_OVERLAP,
++                               MAT_PIPE_PREPASS_FORWARD,
++                               MAT_PIPE_PREPASS_DEFERRED,
++                               MAT_PIPE_PREPASS_PLANAR);
++  const bool graph_has_transparency = GPU_material_flag_get(gpumat, GPU_MATFLAG_TRANSPARENT);
++  bool use_transparency = graph_has_transparency;
++  if (pipeline_type == MAT_PIPE_SHADOW) {
++    use_transparency = graph_has_transparency &&
++                       ELEM(material_shadow_alpha_mode, MA_BS_CLIP, MA_BS_HASHED);
++  }
++  else if (is_prepass) {
++    use_transparency = graph_has_transparency && material_alpha_mode != MA_BM_SOLID;
++  }
++
++  if (graph_has_transparency) {
++    /* Keep transparent closures available to the material graph even when Opaque/Solid disables
++     * coverage testing for a specific prepass. */
++    info.define("MAT_TRANSPARENT");
++
++    /* Alpha Blend has no velocity-specific depth pass. Opaque materials may still contain a
++     * Transparent BSDF in their graph, so use the selected mode rather than the graph flag. */
++    if (material_alpha_mode != MA_BM_SOLID &&
++        pipeline_type == MAT_PIPE_PREPASS_FORWARD_VELOCITY)
++    {
+       pipeline_type = MAT_PIPE_PREPASS_FORWARD;
+     }
+   }
+   info.compilation_constant(gpu::shader::Type::bool_t, "use_transparency", use_transparency);
++  info.compilation_constant(
++      gpu::shader::Type::int_t, "material_alpha_mode", material_alpha_mode);
++  info.compilation_constant(
++      gpu::shader::Type::int_t, "material_shadow_alpha_mode", material_shadow_alpha_mode);
++  info.compilation_constant(gpu::shader::Type::int_t,
++                            "material_alpha_threshold_u16",
++                            material_alpha_threshold_u16);
+ 
+   const bool use_raycast = GPU_material_flag_get(gpumat, GPU_MATFLAG_RAYCAST) &&
+                            ELEM(pipeline_type,
+@@ -1624,7 +1660,6 @@ void ShaderModule::material_create_info_amend(GPUMaterial *gpumat, GPUCodegenOut
+     }
+   }
+ 
+-  const blender::Material *blender_mat = GPU_material_get_material(gpumat);
+   const bool depth_offset_affect_lighting = material_depth_offset_affects_lighting(blender_mat);
+   const bool has_depth_offset = GPU_material_has_depth_offset_output(gpumat) &&
+                                 material_pipeline_supports_depth_offset(pipeline_type,
+@@ -2673,7 +2708,7 @@ static GPUPass *pass_replacement_cb(void *void_thunk, GPUMaterial *mat)
+                                  transparent_shadows,
+                                  use_outline,
+                                  depth_offset_affect_lighting);
+-  UNUSED_VARS(depth_offset_affect_lighting);
++  UNUSED_VARS(transparent_shadows, depth_offset_affect_lighting);
+ 
+   bool is_shadow_pass = pipeline_type == eMaterialPipeline::MAT_PIPE_SHADOW;
+   bool is_prepass = ELEM(pipeline_type,
+@@ -2686,8 +2721,12 @@ static GPUPass *pass_replacement_cb(void *void_thunk, GPUMaterial *mat)
+ 
+   bool has_vertex_displacement = GPU_material_has_displacement_output(mat) &&
+                                  displacement_type != eMaterialDisplacement::MAT_DISPLACEMENT_BUMP;
+-  bool has_transparency = GPU_material_flag_get(mat, GPU_MATFLAG_TRANSPARENT);
+-  bool has_shadow_transparency = has_transparency && transparent_shadows;
++  bool graph_has_transparency = GPU_material_flag_get(mat, GPU_MATFLAG_TRANSPARENT);
++  bool has_transparency = graph_has_transparency &&
++                          (blender_mat == nullptr || blender_mat->blend_method != MA_BM_SOLID);
++  bool has_shadow_transparency =
++      graph_has_transparency && blender_mat != nullptr &&
++      ELEM(blender_mat->blend_shadow, MA_BS_CLIP, MA_BS_HASHED);
+   bool has_raytraced_transmission = blender_mat && (blender_mat->blend_flag & MA_BL_SS_REFRACTION);
+   bool has_raycast = GPU_material_flag_get(mat, GPU_MATFLAG_RAYCAST);
+   bool has_depth_offset = GPU_material_has_depth_offset_output(mat);
+@@ -2760,6 +2799,14 @@ GPUMaterial *ShaderModule::material_shader_get(blender::Material *blender_mat,
+   const bool compile_surface_graph = (pipeline_type != MAT_PIPE_DEFERRED_NPR) ||
+                                      needs_npr_vertex_displacement || needs_npr_depth_offset;
+ 
++  const uint64_t alpha_threshold_key = uint64_t(
++      std::clamp(blender_mat->alpha_threshold, 0.0f, 1.0f) * 65535.0f + 0.5f);
++  const uint64_t alpha_state_key = uint64_t(blender_mat->blend_method) |
++                                   (uint64_t(blender_mat->blend_shadow) << 3u) |
++                                   (alpha_threshold_key << 5u);
++  const uint64_t shader_extra_key = npr_tree_key ^
++                                    (alpha_state_key * 0x9E3779B97F4A7C15ULL);
++
+   uint64_t shader_uuid = shader_uuid_from_material_type(
+       pipeline_type,
+       geometry_type,
+@@ -2769,7 +2816,7 @@ GPUMaterial *ShaderModule::material_shader_get(blender::Material *blender_mat,
+       blender_mat->blend_flag,
+       use_outline,
+       material_depth_offset_affects_lighting(blender_mat),
+-      npr_tree_key);
++      shader_extra_key);
+ 
+   bool is_default_material = default_mat == nullptr;
+   BLI_assert(blender_mat != default_mat);
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_pipeline.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_pipeline.bsl.hh
+index 85c84140..c6bd230f 100644
+--- a/source/blender/draw/engines/eevee/shaders/eevee_pipeline.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_pipeline.bsl.hh
+@@ -13,6 +13,11 @@ struct PipelineConstants {
+   [[compilation_constant]] bool use_clip_plane;
+   [[compilation_constant]] bool use_sss;
+   [[compilation_constant]] bool is_shadow_pipe;
++  /** Legacy Goo alpha state. Values match eMaterial_BlendMethod/eMaterial_BlendShadow. */
++  [[compilation_constant]] int material_alpha_mode;
++  [[compilation_constant]] int material_shadow_alpha_mode;
++  /** Quantized to keep this a scalar integer compilation constant. */
++  [[compilation_constant]] int material_alpha_threshold_u16;
+   [[compilation_constant]] int closure_bin_count;
+ };
+ 
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_surf_depth.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_surf_depth.bsl.hh
+index 58897311..bef0206f 100644
+--- a/source/blender/draw/engines/eevee/shaders/eevee_surf_depth.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_surf_depth.bsl.hh
+@@ -75,18 +75,32 @@ void surf_depth([[resource_table]] PipelineConstants &pipe,
+ 
+     nodetree_surface(0.0f);
+ 
+-#if defined(MAT_OUTLINE_OCCLUSION)
+-    /* Outline resolve needs a binary front-most surface mask. Treat any visible transparent
+-     * coverage as an occluder, but keep fully transparent regions from writing depth. */
+-    float threshold = 1.0f - 1e-5f;
+-#else
+-    float noise_offset = sampling.rng_1D_get(SAMPLING_TRANSPARENCY);
+-    float threshold = hashed_transparency::alpha_threshold(
+-        uni.pipeline_buf.alpha_hash_scale, noise_offset, g_data.P);
+-#endif
+-
+     float transparency = average(g_transmittance);
+-    if (transparency > threshold) {
++    float opacity = saturate(1.0f - transparency);
++    bool discard_fragment = false;
++
++    if (pipe.material_alpha_mode == 3) [[static_branch]] {
++      float clip_threshold = float(pipe.material_alpha_threshold_u16) / 65535.0f;
++      /* The u16 round-trip can move exact values such as 0.5 upward by half an LSB.
++       * Preserve the legacy "equal keeps" clip rule within the quantization precision. */
++      discard_fragment = opacity + (0.5f / 65535.0f) < clip_threshold;
++    }
++    else if (pipe.material_alpha_mode == 4) [[static_branch]] {
++      float noise_offset = sampling.rng_1D_get(SAMPLING_TRANSPARENCY);
++      float threshold = hashed_transparency::alpha_threshold(
++          uni.pipeline_buf.alpha_hash_scale, noise_offset, g_data.P);
++      discard_fragment = transparency > threshold;
++    }
++    else if (pipe.material_alpha_mode == 5) [[static_branch]] {
++      /* The forward pass blends partial coverage. Only fully opaque texels belong in its depth
++       * prepass, matching legacy Eevee's Alpha Blend behavior. */
++      discard_fragment = opacity < (1.0f - 1e-5f);
++    }
++    else if (pipe.material_alpha_mode == 0) [[static_branch]] {
++      discard_fragment = false;
++    }
++
++    if (discard_fragment) {
+       gpu_discard_fragment();
+       return;
+     }
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_surf_shadow.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_surf_shadow.bsl.hh
+index e548886c..12ab269f 100644
+--- a/source/blender/draw/engines/eevee/shaders/eevee_surf_shadow.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_surf_shadow.bsl.hh
+@@ -74,11 +74,22 @@ void surf_shadow([[resource_table]] PipelineConstants &pipe,
+ 
+     nodetree_surface(0.0f);
+ 
+-    float noise_offset = sampling.rng_1D_get(SAMPLING_TRANSPARENCY);
+-    float random_threshold = pcg4d(float4(g_data.P, noise_offset)).x;
+-
+     float transparency = average(g_transmittance);
+-    if (transparency > random_threshold) {
++    float opacity = saturate(1.0f - transparency);
++    bool discard_fragment = false;
++
++    if (pipe.material_shadow_alpha_mode == 2) [[static_branch]] {
++      float clip_threshold = float(pipe.material_alpha_threshold_u16) / 65535.0f;
++      /* Keep equality stable after quantizing the material threshold to u16. */
++      discard_fragment = opacity + (0.5f / 65535.0f) < clip_threshold;
++    }
++    else if (pipe.material_shadow_alpha_mode == 3) [[static_branch]] {
++      float noise_offset = sampling.rng_1D_get(SAMPLING_TRANSPARENCY);
++      float random_threshold = pcg4d(float4(g_data.P, noise_offset)).x;
++      discard_fragment = transparency > random_threshold;
++    }
++
++    if (discard_fragment) {
+       gpu_discard_fragment();
+       return;
+     }
+diff --git a/source/blender/gpu/intern/gpu_codegen.cc b/source/blender/gpu/intern/gpu_codegen.cc
+index 46b9abac..28f75b62 100644
+--- a/source/blender/gpu/intern/gpu_codegen.cc
++++ b/source/blender/gpu/intern/gpu_codegen.cc
+@@ -150,7 +150,12 @@ const char *GPUCodegenCreateInfo::NameBuffer::append_sampler_name(const char nam
+ GPUCodegen::GPUCodegen(GPUMaterial *mat_, GPUNodeGraph *graph_, const char *debug_name)
+     : mat(*mat_), graph(*graph_)
+ {
+-  BLI_hash_mm2a_init(&hm2a_, GPU_material_uuid_get(&mat));
++  /* Murmur2A accepts a 32-bit seed while material UUIDs are 64-bit. Folding both halves is
++   * required: EEVEE stores graph/alpha variant identity in the high UUID bits, and implicit
++   * truncation made different Alpha Threshold shaders share one global GPUPass. */
++  const uint64_t material_uuid = GPU_material_uuid_get(&mat);
++  const uint32_t material_uuid_seed = uint32_t(material_uuid) ^ uint32_t(material_uuid >> 32u);
++  BLI_hash_mm2a_init(&hm2a_, material_uuid_seed);
+   BLI_hash_mm2a_add_int(&hm2a_, GPU_material_flag(&mat));
+   BLI_hash_mm2a_add_int(&hm2a_, GPU_material_recompile_serial_get(&mat));
+   create_info = MEM_new<GPUCodegenCreateInfo>(__func__, debug_name);
+diff --git a/source/blender/makesrna/intern/rna_material.cc b/source/blender/makesrna/intern/rna_material.cc
+index 3a381ba4..f5f7c261 100644
+--- a/source/blender/makesrna/intern/rna_material.cc
++++ b/source/blender/makesrna/intern/rna_material.cc
+@@ -355,18 +355,24 @@ static void rna_Material_active_paint_texture_index_update(bContext *C, PointerR
+ static int rna_Material_blend_method_get(PointerRNA *ptr)
+ {
+   Material *material = id_cast<Material *>(ptr->owner_id);
+-  switch (material->surface_render_method) {
+-    case MA_SURFACE_METHOD_DEFERRED:
+-      return MA_BM_HASHED;
+-    case MA_SURFACE_METHOD_FORWARD:
+-      return MA_BM_BLEND;
++  switch (material->blend_method) {
++    case MA_BM_SOLID:
++    case MA_BM_CLIP:
++    case MA_BM_HASHED:
++    case MA_BM_BLEND:
++      return material->blend_method;
+   }
+-  return MA_BM_HASHED;
++
++  /* Fallback for malformed data written by an earlier NPR-port build. */
++  return material->surface_render_method == MA_SURFACE_METHOD_FORWARD ? MA_BM_BLEND :
++                                                                        MA_BM_HASHED;
+ }
+ 
+ static void rna_Material_blend_method_set(PointerRNA *ptr, int new_blend_method)
+ {
+   Material *material = id_cast<Material *>(ptr->owner_id);
++  material->blend_method = eMaterial_BlendMethod(new_blend_method);
++
+   switch (new_blend_method) {
+     case MA_BM_SOLID:
+     case MA_BM_CLIP:
+@@ -384,10 +390,12 @@ static void rna_Material_render_method_set(PointerRNA *ptr, int new_render_metho
+   Material *material = id_cast<Material *>(ptr->owner_id);
+   material->surface_render_method = eMaterial_SurfaceRenderMethod(new_render_method);
+ 
+-  /* Still sets the legacy property for forward compatibility. */
++  /* Keep Opaque, Clip and Hashed distinguishable inside the deferred pipeline. */
+   switch (new_render_method) {
+     case MA_SURFACE_METHOD_DEFERRED:
+-      material->blend_method = MA_BM_HASHED;
++      if (material->blend_method == MA_BM_BLEND) {
++        material->blend_method = MA_BM_HASHED;
++      }
+       break;
+     case MA_SURFACE_METHOD_FORWARD:
+       material->blend_method = MA_BM_BLEND;
+@@ -421,14 +429,28 @@ static void rna_Material_use_backface_culling_set(PointerRNA *ptr, bool new_valu
+   SET_FLAG_FROM_TEST(material->blend_flag, new_value, MA_BL_CULL_BACKFACE);
+ }
+ 
++static bool rna_Material_transparent_shadow_get(PointerRNA *ptr)
++{
++  Material *material = id_cast<Material *>(ptr->owner_id);
++  return ELEM(material->blend_shadow, MA_BS_CLIP, MA_BS_HASHED);
++}
++
+ static void rna_Material_transparent_shadow_set(PointerRNA *ptr, bool new_value)
+ {
+   Material *material = id_cast<Material *>(ptr->owner_id);
+   SET_FLAG_FROM_TEST(material->blend_flag, new_value, MA_BL_TRANSPARENT_SHADOW);
+-  /* Still sets the legacy property for forward compatibility. */
+   material->blend_shadow = new_value ? MA_BS_HASHED : MA_BS_SOLID;
+ }
+ 
++static void rna_Material_shadow_method_set(PointerRNA *ptr, int new_shadow_method)
++{
++  Material *material = id_cast<Material *>(ptr->owner_id);
++  material->blend_shadow = eMaterial_BlendShadow(new_shadow_method);
++  SET_FLAG_FROM_TEST(material->blend_flag,
++                     ELEM(new_shadow_method, MA_BS_CLIP, MA_BS_HASHED),
++                     MA_BL_TRANSPARENT_SHADOW);
++}
++
+ static bool rna_Material_use_nodes_get(PointerRNA * /*ptr*/)
+ {
+   /* #use_nodes is deprecated. All materials now use nodes. */
+@@ -1197,6 +1219,22 @@ void RNA_def_material(BlenderRNA *brna)
+   };
+ #  endif
+ 
++  static const EnumPropertyItem prop_eevee_shadow_items[] = {
++      {MA_BS_NONE, "NONE", 0, "None", "Do not cast a shadow"},
++      {MA_BS_SOLID, "OPAQUE", 0, "Opaque", "Cast a fully opaque shadow"},
++      {MA_BS_CLIP,
++       "CLIP",
++       0,
++       "Alpha Clip",
++       "Use the alpha threshold to clip shadow visibility"},
++      {MA_BS_HASHED,
++       "HASHED",
++       0,
++       "Alpha Hashed",
++       "Use noise to dither shadow visibility"},
++      {0, nullptr, 0, nullptr, nullptr},
++  };
++
+   static const EnumPropertyItem prop_eevee_surface_render_method_items[] = {
+       {MA_SURFACE_METHOD_DEFERRED,
+        "DITHERED",
+@@ -1386,9 +1424,7 @@ void RNA_def_material(BlenderRNA *brna)
+   prop = RNA_def_property(srna, "blend_method", PROP_ENUM, PROP_NONE);
+   RNA_def_property_enum_items(prop, prop_eevee_blend_items);
+   RNA_def_property_ui_text(
+-      prop,
+-      "Blend Mode",
+-      "Blend Mode for Transparent Faces (Deprecated: use 'surface_render_method')");
++      prop, "Alpha Mode", "How the material alpha controls surface visibility in Eevee");
+   RNA_def_property_enum_funcs(
+       prop, "rna_Material_blend_method_get", "rna_Material_blend_method_set", nullptr);
+   RNA_def_property_translation_context(prop, BLT_I18NCONTEXT_ID_MATERIAL);
+@@ -1400,6 +1436,13 @@ void RNA_def_material(BlenderRNA *brna)
+                            "Clip Threshold",
+                            "A pixel is rendered only if its alpha value is above this threshold");
+   RNA_def_property_update(prop, 0, "rna_Material_draw_update");
++
++  prop = RNA_def_property(srna, "shadow_method", PROP_ENUM, PROP_NONE);
++  RNA_def_property_enum_sdna(prop, nullptr, "blend_shadow");
++  RNA_def_property_enum_items(prop, prop_eevee_shadow_items);
++  RNA_def_property_enum_funcs(prop, nullptr, "rna_Material_shadow_method_set", nullptr);
++  RNA_def_property_ui_text(prop, "Shadow Alpha Mode", "How material alpha controls cast shadows");
++  RNA_def_property_update(prop, 0, "rna_Material_draw_update");
+ #  endif
+ 
+   prop = RNA_def_property(srna, "use_transparency_overlap", PROP_BOOLEAN, PROP_NONE);
+@@ -1563,7 +1606,8 @@ void RNA_def_material(BlenderRNA *brna)
+ 
+   prop = RNA_def_property(srna, "use_transparent_shadow", PROP_BOOLEAN, PROP_NONE);
+   RNA_def_property_boolean_sdna(prop, nullptr, "blend_flag", MA_BL_TRANSPARENT_SHADOW);
+-  RNA_def_property_boolean_funcs(prop, nullptr, "rna_Material_transparent_shadow_set");
++  RNA_def_property_boolean_funcs(
++      prop, "rna_Material_transparent_shadow_get", "rna_Material_transparent_shadow_set");
+   RNA_def_property_ui_text(
+       prop,
+       "Transparent Shadows",
